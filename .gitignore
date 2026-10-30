@@ -1,0 +1,59 @@
+# Android/IntelliJ IDEA
+/.idea/
+/.gradle/
+/build/
+/app/build/
+.local
+*.iml
+*.hprof
+*.log
+local.properties
+
+sdk/
+platform-tools/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Gradle
+.gradle/
+.gradle/
+build/
+
+# Dependencies
+derivations/
+.inferred
+
+# Kotlin
+*.kotlin_module
+
+# Multi-platform
+*.log
+
+# Node/npm
+node_modules/
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+.env.development
+
+# Logs
+term.log
+*.log
