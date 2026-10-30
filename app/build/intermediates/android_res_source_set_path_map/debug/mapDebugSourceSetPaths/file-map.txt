@@ -1,0 +1,8 @@
+com.prima.spimchirp.app-pngs-0 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/build/generated/res/pngs/debug
+com.prima.spimchirp.app-updated_navigation_xml-1 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/build/generated/updated_navigation_xml/debug
+com.prima.spimchirp.app-packageDebugResources-2 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+com.prima.spimchirp.app-packageDebugResources-3 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+com.prima.spimchirp.app-debug-4 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/build/intermediates/merged_res/debug/mergeDebugResources
+com.prima.spimchirp.app-debug-5 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/src/debug/res
+com.prima.spimchirp.app-main-6 /Users/arshbuttar/AndroidStudioProjects/spim-chirp/app/src/main/res
+gradleHome-0 /Users/arshbuttar/.gradle

@@ -1,0 +1,10 @@
+[
+    {
+        "merged": "com.prima.spimchirp.app-debug-51:/mipmap-hdpi_ic_launcher.xml.flat",
+        "source": "com.prima.spimchirp.app-main-53:/mipmap-hdpi/ic_launcher.xml"
+    },
+    {
+        "merged": "com.prima.spimchirp.app-debug-51:/drawable_ic_launcher_foreground.xml.flat",
+        "source": "com.prima.spimchirp.app-main-53:/drawable/ic_launcher_foreground.xml"
+    }
+]
