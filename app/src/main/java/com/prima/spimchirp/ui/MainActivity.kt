@@ -18,7 +18,11 @@ class MainActivity : ComponentActivity() {
       ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1001)
     }
 
-    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    // Respects the Keep screen on setting instead of forcing it on
+    val prefs = getSharedPreferences(SpimViewModel.PREFS_NAME, MODE_PRIVATE)
+    if (prefs.getBoolean(SpimViewModel.KEY_KEEP_SCREEN_ON, true)) {
+      window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
 
     setContent {
       SpimApp()

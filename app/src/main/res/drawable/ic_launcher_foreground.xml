@@ -1,13 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
-  android:width="108dp"
-  android:height="108dp"
-  android:viewportWidth="108"
-  android:viewportHeight="108">
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+  <!-- Five rounded waveform bars, tallest in the centre.
+       Gradient runs from the Beam pink (#FF90E8) to the Beam yellow (#FFC700)
+       so the launcher mark matches the in-app Beam zone. -->
   <path
-    android:fillColor="#3AD4EB"
-    android:pathData="M34,54 C34,42.95 42.95,34 54,34 C65.05,34 74,42.95 74,54 C74,65.05 65.05,74 54,74 C42.95,74 34,65.05 34,54Z" />
-  <path
-    android:fillColor="#1A1A2E"
-    android:pathData="M46,50 C46,48 48,46 50,46 L58,46 C60,46 62,48 62,50 L62,58 C62,60 60,62 58,62 L50,62 C48,62 46,60 46,58Z" />
+      android:pathData="M28,46 L28,62 M41,37 L41,71 M54,29 L54,79 M67,37 L67,71 M80,46 L80,62"
+      android:strokeWidth="7"
+      android:strokeLineCap="round">
+    <aapt:attr name="android:strokeColor">
+      <gradient
+          android:type="linear"
+          android:startX="24"
+          android:startY="79"
+          android:endX="84"
+          android:endY="29"
+          android:startColor="#FFFF90E8"
+          android:endColor="#FFFFC700" />
+    </aapt:attr>
+  </path>
 </vector>

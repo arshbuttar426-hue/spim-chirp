@@ -1,9 +1,12 @@
 package com.prima.spimchirp.ui
 
 import android.Manifest
+import android.app.Activity
+import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -13,40 +16,52 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.prima.spimchirp.audio.ChirpPlayer
@@ -63,9 +78,44 @@ import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import kotlin.time.Duration.Companion.milliseconds
 
-class SpimViewModel : ViewModel() {
+class SpimViewModel(application: Application) : AndroidViewModel(application) {
   private val player = ChirpPlayer()
   private val recorder = ChirpRecorder()
+
+  private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+  // --- Settings, persisted across launches ---
+  var bandIndex by mutableIntStateOf(prefs.getInt(KEY_BAND, MicrochirpAtoms.DEFAULT_BAND_INDEX))
+    private set
+
+  var keepScreenOn by mutableStateOf(prefs.getBoolean(KEY_KEEP_SCREEN_ON, true))
+    private set
+
+  init {
+    MicrochirpAtoms.applyBand(bandIndex)
+  }
+
+  fun setBand(index: Int) {
+    bandIndex = index
+    prefs.edit().putInt(KEY_BAND, index).apply()
+    MicrochirpAtoms.applyBand(index)
+  }
+
+  fun updateKeepScreenOn(enabled: Boolean) {
+    keepScreenOn = enabled
+    prefs.edit().putBoolean(KEY_KEEP_SCREEN_ON, enabled).apply()
+  }
+
+  fun restoreDefaultSettings() {
+    setBand(MicrochirpAtoms.DEFAULT_BAND_INDEX)
+    updateKeepScreenOn(true)
+  }
+
+  companion object {
+    const val PREFS_NAME = "spim_settings"
+    const val KEY_BAND = "band_index"
+    const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
+  }
 
   var isBeaming by mutableStateOf(false)
     private set
@@ -223,7 +273,7 @@ class SpimViewModel : ViewModel() {
     }
   }
 
-  fun setFile(context: Context, uri: Uri) {
+  fun setFile(context: Context, uri: Uri, onReady: (() -> Unit)? = null) {
     viewModelScope.launch(Dispatchers.IO) {
       try {
         var name = uri.lastPathSegment ?: "file"
@@ -246,6 +296,8 @@ class SpimViewModel : ViewModel() {
           cachedSamples = samples
           beamFinished = false
           isEncodingReady = true
+          // The payload is cached now, so it is safe to transmit.
+          onReady?.invoke()
         }
       } catch (e: Exception) {
         e.printStackTrace()
@@ -508,14 +560,41 @@ private val CatchZoneGreenGradient = Brush.verticalGradient(
   )
 )
 
+// --- Motion scale: one easing, a few durations, two springs, used everywhere ---
+private object Motion {
+  // press and release feedback
+  val press = tween<Float>(140, easing = FastOutSlowInEasing)
+  // values settling (progress fill, colour flips)
+  val settle = tween<Float>(260, easing = FastOutSlowInEasing)
+  // screens arriving and leaving
+  val screenIn = tween<Float>(300, easing = FastOutSlowInEasing)
+  val screenOut = tween<Float>(170, easing = FastOutLinearInEasing)
+  // slide distance for screens and banners coming in and going out
+  val screenInOffset = tween<IntOffset>(300, easing = FastOutSlowInEasing)
+  val screenOutOffset = tween<IntOffset>(170, easing = FastOutLinearInEasing)
+  // a slow, shallow breath for the ready-to-beam state
+  val breath = tween<Float>(1100, easing = FastOutSlowInEasing)
+  // layout shifts (the Beam tile expanding)
+  val layout = spring<Float>(
+    dampingRatio = Spring.DampingRatioMediumBouncy,
+    stiffness = Spring.StiffnessMediumLow
+  )
+  // continuous, physically driven values (mic level)
+  val signal = spring<Float>(
+    dampingRatio = Spring.DampingRatioLowBouncy,
+    stiffness = Spring.StiffnessLow
+  )
+}
+
 @Composable
 fun SpimApp(viewModel: SpimViewModel = viewModel()) {
   val context = LocalContext.current
 
   val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
     if (uri != null) {
-      viewModel.setFile(context, uri)
-      viewModel.beam()
+      // setFile encodes on a background dispatcher; beam only once the payload is cached,
+      // otherwise beam() returns early and the file is never transmitted.
+      viewModel.setFile(context, uri) { viewModel.beam() }
     }
   }
 
@@ -578,7 +657,12 @@ fun SpimApp(viewModel: SpimViewModel = viewModel()) {
         }
       }
     },
-    onCopyClick = { viewModel.copyToClipboard(context) }
+    onCopyClick = { viewModel.copyToClipboard(context) },
+    bandIndex = viewModel.bandIndex,
+    keepScreenOn = viewModel.keepScreenOn,
+    onBandSelected = { viewModel.setBand(it) },
+    onKeepScreenOnChange = { viewModel.updateKeepScreenOn(it) },
+    onRestoreDefaultSettings = { viewModel.restoreDefaultSettings() }
   )
 }
 
@@ -604,59 +688,65 @@ fun SpimAppContent(
   onClearImageClick: () -> Unit = { },
   onReplayAudioClick: () -> Unit = { },
   onCatchClick: () -> Unit,
-  onCopyClick: () -> Unit
+  onCopyClick: () -> Unit,
+  bandIndex: Int = MicrochirpAtoms.DEFAULT_BAND_INDEX,
+  keepScreenOn: Boolean = true,
+  onBandSelected: (Int) -> Unit = { },
+  onKeepScreenOnChange: (Boolean) -> Unit = { },
+  onRestoreDefaultSettings: () -> Unit = { }
 ) {
   var isBeamExpanded by remember { mutableStateOf(initialBeamExpanded) }
-  var showSettingsMenu by remember { mutableStateOf(false) }
+  var showSettings by remember { mutableStateOf(false) }
+  // Held on to so the preview's exit animation still has a frame to fade out
+  var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
+  if (selectedImageBitmap != null) previewBitmap = selectedImageBitmap
 
-  // Flashy Red Pulsing Animation when encoding is ready
-  val infiniteTransition = rememberInfiniteTransition(label = "flashyRed")
+  // Ready-to-beam: a slow, shallow breath instead of a strobe
+  val infiniteTransition = rememberInfiniteTransition(label = "readyPulse")
   val redPulseScale by infiniteTransition.animateFloat(
     initialValue = 1f,
-    targetValue = 1.05f,
+    targetValue = 1.02f,
     animationSpec = infiniteRepeatable(
-      animation = tween(500, easing = FastOutSlowInEasing),
+      animation = Motion.breath,
       repeatMode = RepeatMode.Reverse
     ),
     label = "redPulse"
   )
 
-  // Giant Red Explosion Animation State turning screen red
-  var isExploding by remember { mutableStateOf(false) }
-  val explosionScale by animateFloatAsState(
-    targetValue = if (isExploding) 8f else 0f,
-    animationSpec = tween(durationMillis = 600, easing = FastOutLinearInEasing),
-    label = "explosionScale"
-  )
-  val explosionAlpha by animateFloatAsState(
-    targetValue = if (isExploding) 0.85f else 0f,
-    animationSpec = tween(durationMillis = 600, easing = LinearEasing),
-    label = "explosionAlpha"
-  )
-
-  LaunchedEffect(isExploding) {
-    if (isExploding) {
-      delay(700.milliseconds)
-      isExploding = false
-    }
-  }
-
   val expansionProgress by animateFloatAsState(
     targetValue = if (isBeamExpanded) 1f else 0f,
-    animationSpec = spring(
-      dampingRatio = Spring.DampingRatioLowBouncy,
-      stiffness = Spring.StiffnessLow
-    ),
+    animationSpec = Motion.layout,
     label = "beamExpansion"
   )
 
   val animatedAmp by animateFloatAsState(
     targetValue = if (isListening) micAmplitude.coerceIn(0.15f, 1f) else 1f,
-    animationSpec = spring(
-      dampingRatio = Spring.DampingRatioLowBouncy,
-      stiffness = Spring.StiffnessLow
-    ),
+    animationSpec = Motion.signal,
     label = "micFill"
+  )
+
+  // Hero tiles: a small press-and-settle so taps feel physical
+  val beamPressSource = remember { MutableInteractionSource() }
+  val beamPressed by beamPressSource.collectIsPressedAsState()
+  val beamPressScale by animateFloatAsState(
+    targetValue = if (beamPressed) 0.985f else 1f,
+    animationSpec = Motion.press,
+    label = "beamPress"
+  )
+
+  val catchPressSource = remember { MutableInteractionSource() }
+  val catchPressed by catchPressSource.collectIsPressedAsState()
+  val catchPressScale by animateFloatAsState(
+    targetValue = if (catchPressed) 0.985f else 1f,
+    animationSpec = Motion.press,
+    label = "catchPress"
+  )
+
+  // The gear turns as Settings opens, so the header acknowledges the tap
+  val gearRotation by animateFloatAsState(
+    targetValue = if (showSettings) 90f else 0f,
+    animationSpec = Motion.settle,
+    label = "gearRotation"
   )
 
   val catchTextColor = if (isListening) Color.White else MinimalBlack
@@ -689,11 +779,11 @@ fun SpimAppContent(
             .padding(16.dp),
           horizontalAlignment = Alignment.CenterHorizontally
         ) {
-          // Centered WHITE "spim" branding on top
+          // Branding row: centred wordmark with the settings gear pinned to the end
           Box(
             modifier = Modifier
               .fillMaxWidth()
-              .padding(vertical = 24.dp),
+              .padding(vertical = 12.dp),
             contentAlignment = Alignment.Center
           ) {
             Text(
@@ -704,6 +794,17 @@ fun SpimAppContent(
               letterSpacing = (-2).sp,
               textAlign = TextAlign.Center
             )
+            IconButton(
+              onClick = { showSettings = true },
+              modifier = Modifier.align(Alignment.CenterEnd)
+            ) {
+              Icon(
+                Icons.Default.Settings,
+                contentDescription = "Settings",
+                tint = Color.White.copy(alpha = 0.7f),
+                modifier = Modifier.rotate(gearRotation)
+              )
+            }
           }
 
           // Main Interactive Area: Beam Tile Expands Right & Pushes Catch Tile Offscreen
@@ -724,13 +825,21 @@ fun SpimAppContent(
               Card(
                 shape = RoundedCornerShape(24.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                border = BorderStroke(2.5.dp, Color.White.copy(alpha = 0.9f)),
+                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.14f)),
                 modifier = Modifier
                   .width(beamWidth)
                   .fillMaxHeight()
+                  .graphicsLayer {
+                    scaleX = beamPressScale
+                    scaleY = beamPressScale
+                  }
                   .clip(RoundedCornerShape(24.dp))
                   .background(BeamZoneGradient)
-                  .clickable(enabled = !isBeamExpanded) {
+                  .clickable(
+                    interactionSource = beamPressSource,
+                    indication = LocalIndication.current,
+                    enabled = !isBeamExpanded
+                  ) {
                     isBeamExpanded = true
                   }
               ) {
@@ -835,8 +944,8 @@ fun SpimAppContent(
                             contentAlignment = Alignment.Center
                           ) {
                             Icon(
-                              Icons.Default.Add,
-                              contentDescription = "Image",
+                            Icons.Default.Image,
+                            contentDescription = "Image",
                               tint = Color.White,
                               modifier = Modifier.size(28.dp)
                             )
@@ -884,8 +993,8 @@ fun SpimAppContent(
                             contentAlignment = Alignment.Center
                           ) {
                             Icon(
-                              Icons.AutoMirrored.Filled.List,
-                              contentDescription = "File",
+                            Icons.AutoMirrored.Filled.InsertDriveFile,
+                            contentDescription = "File",
                               tint = Color.White,
                               modifier = Modifier.size(28.dp)
                             )
@@ -933,17 +1042,23 @@ fun SpimAppContent(
               Card(
                 shape = RoundedCornerShape(24.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                border = BorderStroke(2.5.dp, Color.White.copy(alpha = 0.9f)),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
                 modifier = Modifier
                   .align(Alignment.TopEnd)
                   .graphicsLayer {
                     translationX = catchTranslationX.toPx()
+                    scaleX = catchPressScale
+                    scaleY = catchPressScale
                   }
                   .width(catchWidth)
                   .fillMaxHeight()
                   .clip(RoundedCornerShape(24.dp))
                   .background(if (isListening) Color(0xFF101012) else Color.Transparent)
-                  .clickable(enabled = !isBeamExpanded) { onCatchClick() }
+                  .clickable(
+                    interactionSource = catchPressSource,
+                    indication = LocalIndication.current,
+                    enabled = !isBeamExpanded
+                  ) { onCatchClick() }
               ) {
                 Box(modifier = Modifier.fillMaxSize()) {
                   Box(
@@ -971,7 +1086,7 @@ fun SpimAppContent(
                       contentAlignment = Alignment.Center
                     ) {
                       Icon(
-                        Icons.Default.Notifications,
+                        Icons.Default.Mic,
                         contentDescription = "Catch",
                         tint = catchIconTint,
                         modifier = Modifier.size(32.dp)
@@ -991,7 +1106,7 @@ fun SpimAppContent(
                     Spacer(Modifier.height(8.dp))
 
                     val catchStatusLabel = when {
-                      isSignalCaught -> "Signal Caught! ✓"
+                      isSignalCaught -> "Signal caught ✓"
                       isListening -> "Listening..."
                       else -> "Tap to listen"
                     }
@@ -1009,38 +1124,18 @@ fun SpimAppContent(
             }
           }
 
-          // Gesture Control: Scroll/Drag Up Handle at Bottom for Hidden Settings Menu
-          Box(
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(36.dp)
-              .padding(top = 12.dp)
-              .pointerInput(Unit) {
-                detectVerticalDragGestures { _, dragAmount ->
-                  if (dragAmount < -15f) {
-                    showSettingsMenu = true
-                  }
-                }
-              }
-              .clickable { showSettingsMenu = true },
-            contentAlignment = Alignment.Center
+          // Received payload banner
+          AnimatedVisibility(
+            visible = receivedBitmap != null || receivedText.isNotEmpty(),
+            enter = fadeIn(Motion.screenIn) + slideInVertically(Motion.screenInOffset) { it / 8 },
+            exit = fadeOut(Motion.screenOut) + slideOutVertically(Motion.screenOutOffset) { it / 8 }
           ) {
-            Box(
-              modifier = Modifier
-                .width(48.dp)
-                .height(5.dp)
-                .clip(RoundedCornerShape(3.dp))
-                .background(Color.White.copy(alpha = 0.35f))
-            )
-          }
-
-          // Received Image Drop Banner
           if (receivedBitmap != null) {
             Spacer(Modifier.height(16.dp))
             Card(
               shape = RoundedCornerShape(20.dp),
               colors = CardDefaults.cardColors(containerColor = Color.White),
-              border = BorderStroke(2.5.dp, Color(0xFF32CC6C)),
+              border = BorderStroke(1.dp, Color(0xFF32CC6C)),
               modifier = Modifier
                 .fillMaxWidth()
                 .height(260.dp)
@@ -1053,7 +1148,7 @@ fun SpimAppContent(
                 horizontalAlignment = Alignment.CenterHorizontally
               ) {
                 Text(
-                  text = "Received Photo Drop 🎉",
+                  text = "Received photo",
                   color = MinimalBlack,
                   fontSize = 15.sp,
                   fontWeight = FontWeight.Black,
@@ -1089,11 +1184,18 @@ fun SpimAppContent(
               )
             }
           }
+          }
         }
       }
 
       // OVERLAY 1: Image Preview Screen (Shown when image is selected from Gallery)
-      if (selectedImageBitmap != null) {
+      AnimatedVisibility(
+        visible = selectedImageBitmap != null,
+        enter = fadeIn(Motion.screenIn) + slideInVertically(Motion.screenInOffset) { it / 12 },
+        exit = fadeOut(Motion.screenOut) + slideOutVertically(Motion.screenOutOffset) { it / 12 }
+      ) {
+        val bmp = previewBitmap
+        if (bmp != null) {
         Box(
           modifier = Modifier
             .fillMaxSize()
@@ -1134,7 +1236,7 @@ fun SpimAppContent(
             // Image Preview Covering the Screen Area
             Card(
               shape = RoundedCornerShape(24.dp),
-              border = BorderStroke(2.5.dp, Color.White),
+              border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
               colors = CardDefaults.cardColors(containerColor = MinimalBlack),
               modifier = Modifier
                 .fillMaxWidth()
@@ -1143,7 +1245,7 @@ fun SpimAppContent(
             ) {
               Box(modifier = Modifier.fillMaxSize()) {
                 Image(
-                  bitmap = selectedImageBitmap.asImageBitmap(),
+                  bitmap = bmp.asImageBitmap(),
                   contentDescription = "Selected Image",
                   contentScale = ContentScale.Crop,
                   modifier = Modifier.fillMaxSize()
@@ -1177,7 +1279,7 @@ fun SpimAppContent(
               Card(
                 shape = RoundedCornerShape(20.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-                border = BorderStroke(2.5.dp, if (isFlashyRed) Color(0xFFFF2D55) else Color.White),
+                border = BorderStroke(1.5.dp, if (isFlashyRed) Color(0xFFFF2D55) else Color.White.copy(alpha = 0.5f)),
                 modifier = Modifier
                   .fillMaxWidth()
                   .height(64.dp)
@@ -1185,15 +1287,7 @@ fun SpimAppContent(
                   .clip(RoundedCornerShape(20.dp))
                   .background(buttonBgBrush)
                   .clickable(enabled = !isProcessingData && !isBeaming) {
-                    if (isFlashyRed) {
-                      // Trigger 1: Giant Red Explosion
-                      isExploding = true
-                      // Trigger 2: Play audio sound
-                      onBeamImageClick()
-                    } else {
-                      // Start processing / encoding
-                      onBeamImageClick()
-                    }
+                    onBeamImageClick()
                   }
               ) {
                 Box(modifier = Modifier.fillMaxSize()) {
@@ -1213,10 +1307,10 @@ fun SpimAppContent(
                     contentAlignment = Alignment.Center
                   ) {
                     val buttonText = when {
-                      beamFinished -> "Beam Complete ✓"
-                      isBeaming -> "Beaming (${(beamProgress * 100).toInt()}%)..."
-                      isProcessingData -> "Processing Data..."
-                      isFlashyRed -> "BEAM NOW 💥"
+                      beamFinished -> "Beam complete ✓"
+                      isBeaming -> "Sending ${(beamProgress * 100).toInt()}%"
+                      isProcessingData -> "Processing"
+                      isFlashyRed -> "Beam now"
                       else -> "Beam"
                     }
                     val textColor = Color.White
@@ -1246,7 +1340,7 @@ fun SpimAppContent(
                   contentAlignment = Alignment.Center
                 ) {
                   Icon(
-                    Icons.Default.Refresh,
+                    Icons.AutoMirrored.Filled.VolumeUp,
                     contentDescription = "Replay Sound",
                     tint = Color(0xFFFF2D55),
                     modifier = Modifier.size(28.dp)
@@ -1257,93 +1351,22 @@ fun SpimAppContent(
           }
         }
       }
-
-      // Giant Red Explosion Animation Overlay turning screen red when Beam button is clicked!
-      if (explosionScale > 0f) {
-        Box(
-          modifier = Modifier
-            .fillMaxSize()
-            .graphicsLayer {
-              scaleX = explosionScale
-              scaleY = explosionScale
-              alpha = explosionAlpha
-            }
-            .clip(CircleShape)
-            .background(Color(0xFFFF2D55))
-        )
       }
 
-      // OVERLAY 2: Hidden Settings Bottom Sheet (Gesture Trigger: Scroll Up from Bottom)
-      if (showSettingsMenu) {
-        ModalBottomSheet(
-          onDismissRequest = { showSettingsMenu = false },
-          containerColor = Color(0xFF18181A),
-          contentColor = Color.White
-        ) {
-          Column(
-            modifier = Modifier
-              .fillMaxWidth()
-              .padding(24.dp)
-          ) {
-            Text(
-              text = "Settings",
-              fontSize = 24.sp,
-              fontWeight = FontWeight.Black,
-              color = Color.White
-            )
-
-            Spacer(Modifier.height(20.dp))
-
-            Text(
-              text = "Audio Selection",
-              fontSize = 16.sp,
-              fontWeight = FontWeight.Bold,
-              color = Color.White.copy(alpha = 0.9f)
-            )
-
-            Spacer(Modifier.height(12.dp))
-
-            var selectedAudioOption by remember { mutableStateOf("Ultrasonic Chirp (18.5 - 19.5 kHz)") }
-            val options = listOf(
-              "Ultrasonic Chirp (18.5 - 19.5 kHz)",
-              "Near-Ultrasonic (17.5 - 18.5 kHz)",
-              "Audible Chirp (15 - 16 kHz)"
-            )
-
-            options.forEach { option ->
-              Row(
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .clickable { selectedAudioOption = option }
-                  .padding(vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-              ) {
-                RadioButton(
-                  selected = (option == selectedAudioOption),
-                  onClick = { selectedAudioOption = option },
-                  colors = RadioButtonDefaults.colors(selectedColor = Color.White, unselectedColor = Color.Gray)
-                )
-                Spacer(Modifier.width(12.dp))
-                Text(
-                  text = option,
-                  fontSize = 14.sp,
-                  fontWeight = FontWeight.Medium,
-                  color = Color.White
-                )
-              }
-            }
-
-            Spacer(Modifier.height(24.dp))
-
-            Button(
-              onClick = { showSettingsMenu = false },
-              modifier = Modifier.fillMaxWidth(),
-              colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = MinimalBlack)
-            ) {
-              Text("Done", fontWeight = FontWeight.Bold)
-            }
-          }
-        }
+      // OVERLAY 2: Settings, opened from the gear in the header
+      AnimatedVisibility(
+        visible = showSettings,
+        enter = fadeIn(Motion.screenIn) + slideInVertically(Motion.screenInOffset) { it / 12 },
+        exit = fadeOut(Motion.screenOut) + slideOutVertically(Motion.screenOutOffset) { it / 12 }
+      ) {
+        SettingsScreen(
+          bandIndex = bandIndex,
+          keepScreenOn = keepScreenOn,
+          onBandSelected = onBandSelected,
+          onKeepScreenOnChange = onKeepScreenOnChange,
+          onRestoreDefaultSettings = onRestoreDefaultSettings,
+          onClose = { showSettings = false }
+        )
       }
     }
   }
@@ -1384,6 +1407,241 @@ fun SpimAppExpandedPreview() {
     onCatchClick = { },
     onCopyClick = { }
   )
+}
+
+@Composable
+private fun SettingsSectionTitle(text: String) {
+  Text(
+    text = text.uppercase(),
+    fontSize = 12.sp,
+    fontWeight = FontWeight.Bold,
+    letterSpacing = 1.sp,
+    color = Color.White.copy(alpha = 0.5f),
+    modifier = Modifier.padding(top = 24.dp, bottom = 8.dp, start = 4.dp)
+  )
+}
+
+@Composable
+fun SettingsScreen(
+  bandIndex: Int,
+  keepScreenOn: Boolean,
+  onBandSelected: (Int) -> Unit,
+  onKeepScreenOnChange: (Boolean) -> Unit,
+  onRestoreDefaultSettings: () -> Unit,
+  onClose: () -> Unit
+) {
+  val context = LocalContext.current
+  val activity = context as? Activity
+  val hasMicPermission = ContextCompat.checkSelfPermission(
+    context,
+    Manifest.permission.RECORD_AUDIO
+  ) == PackageManager.PERMISSION_GRANTED
+  val versionLabel = remember(context) {
+    try {
+      val info = context.packageManager.getPackageInfo(context.packageName, 0)
+      "${info.versionName} (${info.longVersionCode})"
+    } catch (e: Exception) {
+      "unknown"
+    }
+  }
+
+  Box(
+    modifier = Modifier
+      .fillMaxSize()
+      .background(ScreenBlackGradient)
+  ) {
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .padding(16.dp)
+        .verticalScroll(rememberScrollState())
+    ) {
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        IconButton(onClick = onClose) {
+          Icon(
+            Icons.AutoMirrored.Filled.ArrowBack,
+            contentDescription = "Back",
+            tint = Color.White
+          )
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+          text = "Settings",
+          fontSize = 24.sp,
+          fontWeight = FontWeight.Bold,
+          color = Color.White
+        )
+      }
+
+      SettingsSectionTitle("Signal")
+
+      MicrochirpAtoms.BANDS.forEachIndexed { index, band ->
+        Row(
+          modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onBandSelected(index) }
+            .padding(vertical = 6.dp),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          RadioButton(
+            selected = index == bandIndex,
+            onClick = { onBandSelected(index) },
+            colors = RadioButtonDefaults.colors(
+              selectedColor = Color.White,
+              unselectedColor = Color.Gray
+            )
+          )
+          Spacer(Modifier.width(4.dp))
+          Column {
+            Text(
+              text = band.name,
+              fontSize = 15.sp,
+              fontWeight = FontWeight.SemiBold,
+              color = Color.White
+            )
+            Text(
+              text = band.detail,
+              fontSize = 12.sp,
+              color = Color.White.copy(alpha = 0.6f)
+            )
+          }
+        }
+      }
+
+      Text(
+        text = "Both devices must be on the same band to decode each other.",
+        fontSize = 12.sp,
+        color = Color.White.copy(alpha = 0.5f),
+        modifier = Modifier.padding(start = 48.dp, top = 4.dp)
+      )
+
+      SettingsSectionTitle("Display")
+
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Column(modifier = Modifier.weight(1f)) {
+          Text(
+            text = "Keep screen on",
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White
+          )
+          Text(
+            text = "Handy during a long beam or while catching",
+            fontSize = 12.sp,
+            color = Color.White.copy(alpha = 0.6f)
+          )
+        }
+        Switch(
+          checked = keepScreenOn,
+          onCheckedChange = { enabled ->
+            onKeepScreenOnChange(enabled)
+            activity?.let {
+              if (enabled) {
+                it.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              } else {
+                it.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              }
+            }
+          },
+          colors = SwitchDefaults.colors(
+            checkedTrackColor = Color(0xFF32CC6C),
+            checkedThumbColor = Color.White,
+            uncheckedTrackColor = Color(0xFF3A3A3E),
+            uncheckedThumbColor = Color.White
+          )
+        )
+      }
+
+      SettingsSectionTitle("App")
+
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Column(modifier = Modifier.weight(1f)) {
+          Text(
+            text = "Microphone",
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White
+          )
+          Text(
+            text = if (hasMicPermission) {
+              "Allowed"
+            } else {
+              "Blocked - catching signals needs it"
+            },
+            fontSize = 12.sp,
+            color = if (hasMicPermission) {
+              Color(0xFF32CC6C)
+            } else {
+              Color(0xFFFF6B6B)
+            }
+          )
+        }
+        if (!hasMicPermission) {
+          TextButton(onClick = {
+            context.startActivity(
+              Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", context.packageName, null)
+              )
+            )
+          }) {
+            Text("Open", fontWeight = FontWeight.Bold)
+          }
+        }
+      }
+
+      Row(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+      ) {
+        Column {
+          Text(
+            text = "Version",
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White
+          )
+          Text(
+            text = versionLabel,
+            fontSize = 12.sp,
+            color = Color.White.copy(alpha = 0.6f)
+          )
+        }
+      }
+
+      Spacer(Modifier.height(28.dp))
+
+      TextButton(
+        onClick = onRestoreDefaultSettings,
+        modifier = Modifier.fillMaxWidth()
+      ) {
+        Text(
+          text = "Restore defaults",
+          fontWeight = FontWeight.Bold,
+          color = Color.White.copy(alpha = 0.7f)
+        )
+      }
+
+      Spacer(Modifier.height(24.dp))
+    }
+  }
 }
 
 @Preview

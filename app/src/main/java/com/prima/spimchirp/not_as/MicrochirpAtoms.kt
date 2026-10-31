@@ -13,19 +13,51 @@ object MicrochirpAtoms {
   const val TAPER_MS: Int = 2
   const val TAPER_SAMPLES: Int = (SAMPLE_RATE * TAPER_MS / 1000f).toInt()
 
-  // 8-FSK Frequencies (3 bits per symbol, 75 bytes/sec throughput)
-  val FREQUENCIES = floatArrayOf(
-    16700f, // 000
-    17200f, // 001
-    17700f, // 010
-    18200f, // 011
-    18700f, // 100
-    19200f, // 101
-    19700f, // 110
-    20200f  // 111
+  // 8-FSK Frequencies (3 bits per symbol, 75 bytes/sec throughput).
+  // The active band is state rather than a constant: the encoder, the decoder and the
+  // signal detector all read it, so picking a band in Settings retunes the whole modem.
+  // Both devices have to be on the same band for a transfer to succeed.
+  data class Band(
+    val name: String,
+    val detail: String,
+    val tones: FloatArray,
+    val noiseReference: Float
   )
 
-  const val FREQ_NOISE: Float = 14000f
+  val BANDS = listOf(
+    Band(
+      name = "Standard",
+      detail = "16.7 - 20.2 kHz - balanced, the shipped default",
+      tones = floatArrayOf(16700f, 17200f, 17700f, 18200f, 18700f, 19200f, 19700f, 20200f),
+      noiseReference = 14000f
+    ),
+    Band(
+      name = "Audible",
+      detail = "10.7 - 14.2 kHz - loudest, works on any speaker",
+      tones = floatArrayOf(10700f, 11200f, 11700f, 12200f, 12700f, 13200f, 13700f, 14200f),
+      noiseReference = 8000f
+    ),
+    Band(
+      name = "Ultrasonic",
+      detail = "18.7 - 22.2 kHz - quietest, needs wide-range hardware",
+      tones = floatArrayOf(18700f, 19200f, 19700f, 20200f, 20700f, 21200f, 21700f, 22200f),
+      noiseReference = 15500f
+    )
+  )
+
+  val DEFAULT_BAND_INDEX = 0
+
+  @Volatile
+  var FREQUENCIES: FloatArray = BANDS[DEFAULT_BAND_INDEX].tones
+
+  @Volatile
+  var FREQ_NOISE: Float = BANDS[DEFAULT_BAND_INDEX].noiseReference
+
+  fun applyBand(index: Int) {
+    val band = BANDS[index.coerceIn(0, BANDS.lastIndex)]
+    FREQUENCIES = band.tones
+    FREQ_NOISE = band.noiseReference
+  }
 
   fun preambleSymbols(): IntArray {
     return IntArray(PREAMBLE_LEN) { i -> if (i % 2 == 0) 0 else 7 }
