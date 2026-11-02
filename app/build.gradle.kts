@@ -56,6 +56,7 @@ android {
 
 dependencies {
   implementation("org.jetbrains.kotlin:kotlin-stdlib:2.0.21")
+  testImplementation("junit:junit:4.13.2")
   implementation("androidx.appcompat:appcompat:1.7.0")
   implementation(platform("androidx.compose:compose-bom:2024.10.01"))
   implementation("androidx.compose.ui:ui")

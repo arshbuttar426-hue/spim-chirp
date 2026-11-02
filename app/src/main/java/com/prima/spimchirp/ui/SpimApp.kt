@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.media.ToneGenerator
 import android.net.Uri
 import android.provider.OpenableColumns
@@ -66,6 +67,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.prima.spimchirp.audio.ChirpPlayer
 import com.prima.spimchirp.audio.ChirpRecorder
+import com.prima.spimchirp.logic.StreamingChirpDecoder
 import com.prima.spimchirp.not_as.MicrochirpAtoms
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -74,6 +76,8 @@ import kotlinx.coroutines.launch
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import kotlin.time.Duration.Companion.milliseconds
@@ -91,6 +95,12 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
   var keepScreenOn by mutableStateOf(prefs.getBoolean(KEY_KEEP_SCREEN_ON, true))
     private set
 
+  /** Display name of the user's local drop sound, or null for the built-in chime. */
+  var dropSoundName by mutableStateOf(prefs.getString(KEY_DROP_SOUND_NAME, null))
+    private set
+
+  private var dropPlayer: MediaPlayer? = null
+
   init {
     MicrochirpAtoms.applyBand(bandIndex)
   }
@@ -106,15 +116,68 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
     prefs.edit().putBoolean(KEY_KEEP_SCREEN_ON, enabled).apply()
   }
 
+  fun setDropSound(context: Context, uri: Uri) {
+    viewModelScope.launch(Dispatchers.IO) {
+      try {
+        val name = displayName(context, uri) ?: "Drop sound"
+        val dest = File(context.filesDir, DROP_SOUND_FILE)
+        context.contentResolver.openInputStream(uri)?.use { input ->
+          dest.outputStream().use { output -> input.copyTo(output) }
+        } ?: return@launch
+        prefs.edit()
+          .putString(KEY_DROP_SOUND_PATH, dest.absolutePath)
+          .putString(KEY_DROP_SOUND_NAME, name)
+          .apply()
+        viewModelScope.launch(Dispatchers.Main.immediate) { dropSoundName = name }
+      } catch (e: Exception) {
+        e.printStackTrace()
+      }
+    }
+  }
+
+  fun clearDropSound() {
+    prefs.edit().remove(KEY_DROP_SOUND_PATH).remove(KEY_DROP_SOUND_NAME).apply()
+    dropSoundName = null
+    try {
+      getApplication<Application>().getFileStreamPath(DROP_SOUND_FILE).delete()
+    } catch (_: Exception) {}
+  }
+
+  private fun displayName(context: Context, uri: Uri): String? {
+    return try {
+      var name: String? = null
+      context.contentResolver.query(uri, null, null, null, null)?.use {
+        if (it.moveToFirst()) {
+          val idx = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+          if (idx >= 0) name = it.getString(idx)
+        }
+      }
+      name ?: uri.lastPathSegment ?: "Drop sound"
+    } catch (_: Exception) {
+      uri.lastPathSegment ?: "Drop sound"
+    }
+  }
+
   fun restoreDefaultSettings() {
     setBand(MicrochirpAtoms.DEFAULT_BAND_INDEX)
     updateKeepScreenOn(true)
+    clearDropSound()
+  }
+
+  override fun onCleared() {
+    super.onCleared()
+    try { dropPlayer?.release() } catch (_: Exception) {}
+    dropPlayer = null
+    try { recorder.stop() } catch (_: Exception) {}
   }
 
   companion object {
     const val PREFS_NAME = "spim_settings"
     const val KEY_BAND = "band_index"
     const val KEY_KEEP_SCREEN_ON = "keep_screen_on"
+    const val KEY_DROP_SOUND_PATH = "drop_sound_path"
+    const val KEY_DROP_SOUND_NAME = "drop_sound_name"
+    const val DROP_SOUND_FILE = "drop_sound"
   }
 
   var isBeaming by mutableStateOf(false)
@@ -162,6 +225,10 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
 
   private var micJob: Job? = null
   private var decodeJob: Job? = null
+
+  /** Chunks flow recorder thread -> decoder coroutine. Bounded so a stalled
+   *  decoder cannot grow memory without limit. */
+  private val decodeQueue = LinkedBlockingQueue<FloatArray>(512)
 
   // 16-Color Palette for fallback
   private val paletteColors = intArrayOf(
@@ -380,6 +447,7 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
     isSignalCaught = false
     receivedText = ""
     receivedBitmap = null
+    decodeQueue.clear()
 
     if (!hasRecordPermission) {
       return
@@ -392,6 +460,7 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
   fun stopCatchPipeline() {
     decodeJob?.cancel()
     decodeJob = null
+    decodeQueue.clear()
     stopMicRecording()
     setVisualListeningActive(false)
   }
@@ -400,6 +469,13 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
     micJob?.cancel()
     micJob = viewModelScope.launch(Dispatchers.Default) {
       recorder.startStreaming { chunk ->
+        // Hand every chunk straight to the streaming decoder. This is what
+        // makes decoding automatic: no snapshot, and no need to stop.
+        if (!decodeQueue.offer(chunk)) {
+          decodeQueue.poll()
+          decodeQueue.offer(chunk)
+        }
+
         var sum = 0f
         for (v in chunk) {
           sum += v * v
@@ -430,36 +506,65 @@ class SpimViewModel(application: Application) : AndroidViewModel(application) {
 
   private fun startSignalDecoder() {
     decodeJob?.cancel()
-    decodeJob = viewModelScope.launch(Dispatchers.IO) {
+    decodeQueue.clear()
+    val decoder = StreamingChirpDecoder()
+    decodeJob = viewModelScope.launch(Dispatchers.Default) {
       while (isListeningUI) {
-        if (recorder.isRecording()) {
-          val snap = recorder.getSnapshot()
-          if (snap.size > MicrochirpAtoms.SYMBOL_SAMPLES * (MicrochirpAtoms.PREAMBLE_LEN + 16)) {
-            val tunedPresent = MicrochirpAtoms.isTunedSignalPresent(snap)
-            if (tunedPresent) {
-              viewModelScope.launch(Dispatchers.Main.immediate) {
-                isSignalCaught = true
-              }
-            }
+        val chunk = try {
+          decodeQueue.poll(120, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+          null
+        } ?: continue
 
-            val res = MicrochirpAtoms.decodeSamples(snap)
-            res.onSuccess { bytes ->
-              if (isListeningUI) {
-                viewModelScope.launch(Dispatchers.Main.immediate) {
-                  isSignalCaught = true
-                  delay(200.milliseconds)
-                  stopCatchPipeline()
-                  handleReceivedBytes(bytes)
-                  playCue(ToneGenerator.TONE_PROP_ACK)
-                }
-                return@launch
-              }
+        val bytes = try {
+          decoder.feed(chunk)
+        } catch (e: Exception) {
+          e.printStackTrace()
+          null
+        }
+
+        if (bytes != null && isListeningUI) {
+          viewModelScope.launch(Dispatchers.Main.immediate) {
+            isSignalCaught = true
+            handleReceivedBytes(bytes)
+            playDropSound()
+          }
+          // Continuous by design: the mic and decoder stay armed, so the next
+          // drop needs no tap. The signalled state is only a visual pulse.
+          viewModelScope.launch(Dispatchers.Main.immediate) {
+            delay(1400.milliseconds)
+            if (isListeningUI) {
+              isSignalCaught = false
             }
           }
         }
-        delay(100.milliseconds)
       }
     }
+  }
+
+  /** Play the user's local drop sound, falling back to the built-in chime. */
+  private fun playDropSound() {
+    val path = prefs.getString(KEY_DROP_SOUND_PATH, null)
+    if (path != null && File(path).exists()) {
+      try {
+        dropPlayer?.release()
+        dropPlayer = MediaPlayer().apply {
+          setDataSource(path)
+          setOnCompletionListener { mp ->
+            try { mp.release() } catch (_: Exception) {}
+            if (dropPlayer === mp) dropPlayer = null
+          }
+          prepare()
+          start()
+        }
+        return
+      } catch (e: Exception) {
+        e.printStackTrace()
+        try { dropPlayer?.release() } catch (_: Exception) {}
+        dropPlayer = null
+      }
+    }
+    playCue(ToneGenerator.TONE_PROP_ACK)
   }
 
   private fun handleReceivedBytes(bytes: ByteArray) {
@@ -604,6 +709,12 @@ fun SpimApp(viewModel: SpimViewModel = viewModel()) {
     }
   }
 
+  val dropSoundLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    if (uri != null) {
+      viewModel.setDropSound(context, uri)
+    }
+  }
+
   val permissionLauncher = rememberLauncherForActivityResult(
     ActivityResultContracts.RequestPermission()
   ) { isGranted ->
@@ -660,6 +771,9 @@ fun SpimApp(viewModel: SpimViewModel = viewModel()) {
     onCopyClick = { viewModel.copyToClipboard(context) },
     bandIndex = viewModel.bandIndex,
     keepScreenOn = viewModel.keepScreenOn,
+    dropSoundName = viewModel.dropSoundName,
+    onChooseDropSound = { dropSoundLauncher.launch(arrayOf("audio/*")) },
+    onResetDropSound = { viewModel.clearDropSound() },
     onBandSelected = { viewModel.setBand(it) },
     onKeepScreenOnChange = { viewModel.updateKeepScreenOn(it) },
     onRestoreDefaultSettings = { viewModel.restoreDefaultSettings() }
@@ -691,6 +805,9 @@ fun SpimAppContent(
   onCopyClick: () -> Unit,
   bandIndex: Int = MicrochirpAtoms.DEFAULT_BAND_INDEX,
   keepScreenOn: Boolean = true,
+  dropSoundName: String? = null,
+  onChooseDropSound: () -> Unit = { },
+  onResetDropSound: () -> Unit = { },
   onBandSelected: (Int) -> Unit = { },
   onKeepScreenOnChange: (Boolean) -> Unit = { },
   onRestoreDefaultSettings: () -> Unit = { }
@@ -1362,6 +1479,9 @@ fun SpimAppContent(
         SettingsScreen(
           bandIndex = bandIndex,
           keepScreenOn = keepScreenOn,
+          dropSoundName = dropSoundName,
+          onChooseDropSound = onChooseDropSound,
+          onResetDropSound = onResetDropSound,
           onBandSelected = onBandSelected,
           onKeepScreenOnChange = onKeepScreenOnChange,
           onRestoreDefaultSettings = onRestoreDefaultSettings,
@@ -1425,6 +1545,9 @@ private fun SettingsSectionTitle(text: String) {
 fun SettingsScreen(
   bandIndex: Int,
   keepScreenOn: Boolean,
+  dropSoundName: String? = null,
+  onChooseDropSound: () -> Unit = { },
+  onResetDropSound: () -> Unit = { },
   onBandSelected: (Int) -> Unit,
   onKeepScreenOnChange: (Boolean) -> Unit,
   onRestoreDefaultSettings: () -> Unit,
@@ -1563,6 +1686,49 @@ fun SettingsScreen(
       }
 
       SettingsSectionTitle("App")
+
+      Column(
+        modifier = Modifier
+          .fillMaxWidth()
+          .padding(vertical = 4.dp)
+      ) {
+        Text(
+          text = "Drop sound",
+          fontSize = 15.sp,
+          fontWeight = FontWeight.SemiBold,
+          color = Color.White
+        )
+        Text(
+          text = dropSoundName ?: "Built-in chime",
+          fontSize = 12.sp,
+          color = Color.White.copy(alpha = 0.6f),
+          modifier = Modifier.padding(top = 2.dp)
+        )
+        Row(
+          modifier = Modifier.padding(top = 10.dp),
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          OutlinedButton(
+            onClick = onChooseDropSound,
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+          ) {
+            Text("Choose audio file", fontSize = 13.sp)
+          }
+          if (dropSoundName != null) {
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = onResetDropSound) {
+              Text("Reset", fontSize = 13.sp, color = Color.White.copy(alpha = 0.7f))
+            }
+          }
+        }
+        Text(
+          text = "Plays from this device when a drop is caught. Nothing is uploaded.",
+          fontSize = 12.sp,
+          color = Color.White.copy(alpha = 0.45f),
+          modifier = Modifier.padding(top = 6.dp)
+        )
+      }
 
       Row(
         modifier = Modifier

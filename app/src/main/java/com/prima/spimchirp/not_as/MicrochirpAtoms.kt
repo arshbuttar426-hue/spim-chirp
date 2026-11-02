@@ -329,8 +329,59 @@ object MicrochirpAtoms {
     System.arraycopy(bestMatchSymbols, payloadStartSym, frameSymbols, 0, requiredSymbols)
     val framed = symbolsTo3BitBytes(frameSymbols, totalFramedBytes)
 
+    // Without this, a symbol clock that is a few samples off still produces a
+    // payload of the right length with a few wrong bytes, and nothing downstream
+    // can tell. The encoder appends crc16 of the payload bytes.
+    val expectedCrc = crc16(framed.copyOfRange(4, 4 + len))
+    val receivedCrc = ((framed[4 + len].toInt() and 0xFF) shl 8) or
+      (framed[4 + len + 1].toInt() and 0xFF)
+    if (expectedCrc != receivedCrc) {
+      return Result.failure(Exception("payload CRC16 mismatch"))
+    }
+
     val payload = ByteArray(len)
     System.arraycopy(framed, 4, payload, 0, len)
     return Result.success(payload)
+  }
+
+  /** Payload length declared by the header if a valid one begins at [start],
+   *  else -1. Checks magic and the header CRC8. */
+  fun payloadLengthAt(samples: FloatArray, start: Int): Int {
+    val pre = PREAMBLE_LEN
+    if (start < 0 || samples.size < start + (pre + 11) * SYMBOL_SAMPLES) return -1
+    val headerSymbols = IntArray(11)
+    for (k in 0 until 11) {
+      headerSymbols[k] = symbolVal(samples, start + (pre + k) * SYMBOL_SAMPLES)
+    }
+    val header = symbolsTo3BitBytes(headerSymbols, 4)
+    if (header[0] != MAGIC) return -1
+    if (crc8(byteArrayOf(header[0], header[1], header[2])) != header[3]) return -1
+    val len = ((header[1].toInt() and 0xFF) shl 8) or (header[2].toInt() and 0xFF)
+    if (len <= 0 || len > MAX_PAYLOAD) return -1
+    return len
+  }
+
+  /** Decode the frame whose preamble starts exactly at [start], without
+   *  searching for the preamble. Returns null unless both the header CRC8 and
+   *  the payload CRC16 match. */
+  fun decodeFrameAt(samples: FloatArray, start: Int): ByteArray? {
+    val pre = PREAMBLE_LEN
+    val sym = SYMBOL_SAMPLES
+    val len = payloadLengthAt(samples, start)
+    if (len <= 0) return null
+    val totalBytes = 4 + len + 2
+    val symbolsNeeded = (totalBytes * 8 + 2) / 3
+    if (samples.size < start + (pre + symbolsNeeded) * sym) return null
+
+    val frameSymbols = IntArray(symbolsNeeded)
+    for (k in 0 until symbolsNeeded) {
+      frameSymbols[k] = symbolVal(samples, start + (pre + k) * sym)
+    }
+    val framed = symbolsTo3BitBytes(frameSymbols, totalBytes)
+    val expectedCrc = crc16(framed.copyOfRange(4, 4 + len))
+    val receivedCrc = ((framed[4 + len].toInt() and 0xFF) shl 8) or
+      (framed[4 + len + 1].toInt() and 0xFF)
+    if (expectedCrc != receivedCrc) return null
+    return framed.copyOfRange(4, 4 + len)
   }
 }
